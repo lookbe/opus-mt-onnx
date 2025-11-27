@@ -4,7 +4,7 @@ import numpy as np
 import json
 import os 
 import sentencepiece # NEW DEPENDENCY for core tokenization logic
-from typing import List, Dict, Union, Any, Tuple
+from typing import List, Dict, Union, Any, Tuple, Optional
 
 # --- Define Paths ---
 local_dir = "./my_local_tokenizer_files/"
@@ -13,12 +13,12 @@ target_spm_path = os.path.join(local_dir, "target.spm")
 shared_vocab_path = os.path.join(local_dir, "vocab.json")
 
 # --- Configuration ---
-MODEL_NAME = "Helsinki-NLP/opus-mt-en-de" 
-ENCODER_ONNX_PATH = "onnx-opus/encoder_model.onnx"
-DECODER_ONNX_PATH = "onnx-opus/decoder_model.onnx"
-DECODER_WITH_PAST_ONNX_PATH = "onnx-opus/decoder_with_past_model.onnx"
-MAX_LENGTH = 50
-SOURCE_SENTENCE = "This is an example sentence for Marian NMT, which is a powerful machine translation framework."
+MODEL_NAME = "Helsinki-NLP/opus-mt-id-en" 
+ENCODER_ONNX_PATH = "my_exported_onnx_model/encoder_model.onnx"
+DECODER_ONNX_PATH = "my_exported_onnx_model/decoder_model.onnx"
+DECODER_WITH_PAST_ONNX_PATH = "my_exported_onnx_model/decoder_with_past_model.onnx"
+MAX_LENGTH = 512
+SOURCE_SENTENCE = "halo apa kabar"
 
 # Constant used for cleaning up SentecePiece output
 SPIECE_UNDERLINE = " "
@@ -172,6 +172,111 @@ class MarianTokenizerShim:
             
         return self.convert_tokens_to_string(tokens)
 
+# ----------------------------------------------------
+# --- SequenceBiasLogitsProcessor (NumPy Shim) ---
+# ----------------------------------------------------
+
+class SequenceBiasLogitsProcessor:
+    """
+    Reimplementation of SequenceBiasLogitsProcessor using NumPy for ONNX Runtime.
+    Applies an additive bias on sequences. The bias is applied to the last token of a sequence
+    when the next generated token can complete it.
+    """
+    def __init__(self, sequence_bias: List[List[Union[List[int], float]]]):
+        # Convert List[List[...]] format to Dict[Tuple[int], float] for easier lookup
+        self.sequence_bias: Dict[Tuple[int], float] = self._convert_list_arguments_into_dict(sequence_bias)
+        self.length_1_bias: Optional[np.ndarray] = None
+        self.prepared_bias_variables = False
+        
+    def _convert_list_arguments_into_dict(self, sequence_bias: List[List[Union[List[int], float]]]) -> Dict[Tuple[int], float]:
+        """Converts the sequence_bias input format to a dictionary of token tuples to biases."""
+        converted_bias = {}
+        for item in sequence_bias:
+            # item is [token_list, bias_value]
+            token_list = item[0]
+            bias_value = item[1]
+            # Key must be a hashable type (tuple)
+            converted_bias[tuple(token_list)] = float(bias_value)
+        return converted_bias
+
+    def _prepare_bias_variables(self, scores: np.ndarray):
+        """Precomputes the bias for length=1 sequences and validates tokens."""
+        # scores shape: (batch_size, vocab_size) - we only need vocab_size
+        vocabulary_size = scores.shape[-1]
+
+        # 1. Check biased tokens out of bounds (simplified check)
+        invalid_biases = []
+        for sequence_ids in self.sequence_bias.keys():
+            for token_id in sequence_ids:
+                if token_id >= vocabulary_size:
+                    invalid_biases.append(token_id)
+        if len(invalid_biases) > 0:
+            raise ValueError(
+                f"The model vocabulary size is {vocabulary_size}, but the following tokens were being biased: "
+                f"{invalid_biases}"
+            )
+
+        # 2. Precompute the bias for length 1 sequences.
+        self.length_1_bias = np.zeros((vocabulary_size,), dtype=np.float32)
+        for sequence_ids, bias in self.sequence_bias.items():
+            if len(sequence_ids) == 1:
+                # The bias is applied to the single token ID
+                self.length_1_bias[sequence_ids[-1]] = bias
+
+        self.prepared_bias_variables = True
+        
+    def __call__(self, input_ids: np.ndarray, scores: np.ndarray) -> np.ndarray:
+        """Applies the sequence bias to the token scores (logits)."""
+        # input_ids shape: (batch_size, current_sequence_length)
+        # scores shape: (batch_size, vocab_size)
+
+        # 1 - Prepares the bias tensors.
+        if not self.prepared_bias_variables:
+            self._prepare_bias_variables(scores)
+
+        # 2 - prepares an empty bias to add (using float32 for consistency with ORT outputs)
+        bias = np.zeros_like(scores, dtype=np.float32)
+
+        # 3 - include the bias from length = 1
+        bias += self.length_1_bias
+
+        # 4 - include the bias from length > 1, after determining which biased sequences may be completed.
+        
+        for sequence_ids_tuple, sequence_bias in self.sequence_bias.items():
+            if len(sequence_ids_tuple) == 1:  # the sequence is of length 1, already applied
+                continue
+            
+            sequence_ids = list(sequence_ids_tuple)
+            prefix_length = len(sequence_ids) - 1
+            
+            # Skip if the sequence prefix is longer than the current context
+            if prefix_length >= input_ids.shape[1]: 
+                continue
+                
+            last_token = sequence_ids[-1]
+            
+            # NumPy equivalent of torch.eq(..., ...).prod(dim=1)
+            # Check if the generated sequence ends with the required prefix
+            comparison = np.equal(
+                input_ids[:, -prefix_length:],
+                np.array(sequence_ids[:-1], dtype=input_ids.dtype)
+            )
+            
+            # np.all is the equivalent of .prod(dim=1) for boolean arrays
+            matching_rows = np.all(comparison, axis=1) 
+
+            # Apply bias:
+            # We use np.where to select the bias or 0.0 based on matching_rows
+            bias[:, last_token] += np.where(
+                matching_rows,
+                np.array(sequence_bias, dtype=np.float32),
+                np.array(0.0, dtype=np.float32),
+            )
+
+        # 5 - apply the bias to the scores
+        scores_processed = scores + bias
+        return scores_processed
+
 
 # --- Helper Functions ---
 
@@ -201,7 +306,8 @@ def run_marian_onnx_inference(
     decoder_with_past_session: ort.InferenceSession, 
     tokenizer: MarianTokenizerShim, # Changed type hint
     input_text: str, 
-    max_length: int
+    max_length: int,
+    logits_processor: Optional[SequenceBiasLogitsProcessor] = None # NEW ARGUMENT
 ):
     """Performs sequence-to-sequence translation using the three ONNX models."""
     
@@ -243,6 +349,9 @@ def run_marian_onnx_inference(
     current_decoder_input_ids = decoder_input_ids
     past_key_values = None # Stores list of [dec_k, dec_v, enc_k, enc_v] for each layer
     decoded_token_ids = []
+    
+    # NEW: Accumulate the full sequence generated so far (starts with <pad>)
+    full_decoded_ids_so_far = decoder_input_ids 
     
     for i in range(max_length):
         
@@ -328,7 +437,15 @@ def run_marian_onnx_inference(
         # 8. Select Next Token (Greedy Search)
         # Logits shape: (batch_size, sequence_length_target, vocab_size)
         next_token_logits = logits[:, -1, :] # Logits for the last (newest) token
-        next_token_id = np.argmax(next_token_logits, axis=-1).astype(np.int64)
+        
+        # --- NEW LOGIC: Apply Logits Processor ---
+        processed_logits = next_token_logits
+        if logits_processor is not None:
+            # The processor operates on the accumulated sequence so far and the last step's logits
+            processed_logits = logits_processor(full_decoded_ids_so_far, next_token_logits)
+
+        # Apply argmax (Greedy Search) to the processed logits
+        next_token_id = np.argmax(processed_logits, axis=-1).astype(np.int64)
         
         # Check for End-of-Sentence token
         if next_token_id[0] == tokenizer.eos_token_id:
@@ -339,6 +456,12 @@ def run_marian_onnx_inference(
         
         # The next decoder input is the token we just predicted
         current_decoder_input_ids = next_token_id.reshape(batch_size, 1)
+
+        # NEW: Update the accumulated sequence for the next processor step
+        full_decoded_ids_so_far = np.concatenate(
+            [full_decoded_ids_so_far, current_decoder_input_ids], axis=1
+        )
+
 
     # 10. Decode Output Tokens
     final_output = tokenizer.decode(
@@ -359,7 +482,6 @@ if __name__ == "__main__":
              raise FileNotFoundError("Missing tokenizer files")
 
         # 1. Load Tokenizer - USING CUSTOM SHIM
-        # The shim constructor now directly loads files and sets properties
         tokenizer = MarianTokenizerShim(
             source_spm=source_spm_path, 
             target_spm=target_spm_path,
@@ -375,7 +497,22 @@ if __name__ == "__main__":
         decoder_session = ort.InferenceSession(DECODER_ONNX_PATH)
         decoder_with_past_session = ort.InferenceSession(DECODER_WITH_PAST_ONNX_PATH)
         
-        # 3. Run Inference
+        # 3. Initialize Logits Processor (Pad Token Bias)
+        
+        # Get the ID of the pad token dynamically
+        pad_token_id = tokenizer.pad_token_id
+        
+        # Define the sequence bias configuration to apply a very large negative bias 
+        # to the pad token to prevent its generation (mimicking the image's intent).
+        # np.NINF is used for negative infinity.
+        SEQUENCE_BIAS_CONFIG = [
+            [[pad_token_id], -np.inf],
+        ]
+        
+        print(f"\n💡 Applying sequence bias: Preventing generation of PAD token (ID: {pad_token_id})")
+        bias_processor = SequenceBiasLogitsProcessor(SEQUENCE_BIAS_CONFIG)
+        
+        # 4. Run Inference
         print(f"\nSource: {SOURCE_SENTENCE}")
         print("-" * 30)
         
@@ -385,7 +522,8 @@ if __name__ == "__main__":
             decoder_with_past_session, 
             tokenizer, 
             SOURCE_SENTENCE, 
-            MAX_LENGTH
+            MAX_LENGTH,
+            logits_processor=bias_processor # PASS THE PROCESSOR HERE
         )
         
         print("-" * 30)
